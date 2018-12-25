@@ -1,13 +1,39 @@
 extern crate syn;
+extern crate walkdir;
 
+use walkdir::{WalkDir};
+
+use std::env;
+use std::fs::{File};
+use std::io::{Write};
 use std::path::{PathBuf};
 use std::process::{Command};
+use std::str::{from_utf8};
 
 pub mod prelude {
   pub use crate::{
     Cc::*,
+    Cc,
     Gencode,
   };
+}
+
+fn build_nvptx_target_json(target_arch: &str) -> String {
+  format!("{{
+  \"arch\": \"nvptx64\"
+, \"cpu\": \"{}\"
+, \"data-layout\": \"e-i64:64-v16:16-v32:32-n16:32:64\"
+, \"linker\": false
+, \"linker-flavor\": \"ld\"
+, \"llvm-target\": \"nvptx64-nvidia-cuda\"
+, \"max-atomic-width\": 0
+, \"obj-is-bitcode\": true
+, \"os\": \"cuda\"
+, \"panic-strategy\": \"abort\"
+, \"target-c-int-width\": \"32\"
+, \"target-endian\": \"little\"
+, \"target-pointer-width\": \"64\"
+}}\n", target_arch)
 }
 
 #[allow(non_camel_case_types)]
@@ -67,6 +93,17 @@ pub enum Gencode {
 }
 
 impl Gencode {
+  pub fn target_arch_str(&self) -> &'static str {
+    match self {
+      &Gencode::Ptx(ref cc) => {
+        cc.compute_str()
+      }
+      &Gencode::Sass(ref cc) => {
+        cc.sm_str()
+      }
+    }
+  }
+
   pub fn flags(&self) -> Vec<String> {
     match self {
       &Gencode::Ptx(ref cc) => {
@@ -81,40 +118,107 @@ impl Gencode {
 
 pub struct Builder {
   root_path:        PathBuf,
+  output_path:      PathBuf,
   subcrate_path:    Option<PathBuf>,
   gencodes:         Vec<Gencode>,
+  kernels:          Vec<String>,
 }
 
 impl Default for Builder {
   fn default() -> Builder {
     // TODO
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     Builder{
-      root_path:        PathBuf::from(""), // FIXME
+      root_path:        manifest_dir,
+      output_path:      out_dir,
       subcrate_path:    None,
       gencodes:         Vec::new(),
+      kernels:          Vec::new(),
     }
   }
 }
 
 impl Builder {
+  pub fn crate_dir<P: Into<PathBuf>>(mut self, subcrate_path: P) -> Builder {
+    self.subcrate_path = Some(subcrate_path.into());
+    self
+  }
+
   pub fn gencode(mut self, opt: Gencode) -> Builder {
     self.gencodes.push(opt);
     self
   }
 
-  pub fn whitelist_kernel(mut self, name: String) -> Builder {
-    // TODO
-    //unimplemented!();
+  pub fn whitelist_kernel<S: Into<String>>(mut self, kernel: S) -> Builder {
+    self.kernels.push(kernel.into());
     self
   }
 
   pub fn generate(self) -> Result<Glue, ()> {
     // TODO
+
+    for entry in WalkDir::new(self.subcrate_path.clone().unwrap().to_str().unwrap()) {
+      let entry = entry.unwrap();
+      println!("cargo:rerun-if-changed={}", entry.path().display());
+    }
+
+    let mut xargo_flags: Vec<String> = Vec::new();
     let mut nvcc_flags: Vec<String> = Vec::new();
+
     println!("DEBUG: Builder::generate(): gencodes: {:?}", self.gencodes);
-    let gencode_flags: Vec<String> = self.gencodes.iter().flat_map(|gencode| gencode.flags()).collect();
+    assert_eq!(self.gencodes.len(), 1);
+    let target_json = build_nvptx_target_json(self.gencodes[0].target_arch_str());
+    println!("DEBUG:   target json: {}", target_json);
+    {
+      //let mut target_json_file = File::create(self.output_path.join(format!("nvptx64-nvidia-cuda-{}.json", self.gencodes[0].target_arch_str()))).unwrap();
+      let mut target_json_file = File::create(self.output_path.join(format!("nvptx64-nvidia-cuda.json"))).unwrap();
+      target_json_file.write_all(target_json.as_bytes()).unwrap();
+    }
+
+    xargo_flags.push("rustc".to_string());
+    //xargo_flags.push("--manifest-path".to_string());
+    //xargo_flags.push(self.subcrate_path.clone().unwrap().join("Cargo.toml").as_os_str().to_str().unwrap().to_string());
+    xargo_flags.push("--target".to_string());
+    //xargo_flags.push(format!("nvptx64-nvidia-cuda-{}", self.gencodes[0].target_arch_str()));
+    xargo_flags.push(format!("nvptx64-nvidia-cuda"));
+    xargo_flags.push("--release".to_string());
+    xargo_flags.push("--".to_string());
+    xargo_flags.push("--emit=asm".to_string());
+
+    let mut gencode_flags: Vec<String> = self.gencodes.iter().flat_map(|gencode| gencode.flags()).collect();
     println!("DEBUG:   gencode flags: {:?}", gencode_flags);
-    //unimplemented!();
+    nvcc_flags.append(&mut gencode_flags);
+
+    println!("DEBUG: target path: {:?}", self.output_path.clone());
+    match Command::new("xargo")
+      //.current_dir(self.output_path.clone())
+      .current_dir(self.subcrate_path.clone().unwrap())
+      .env("RUST_TARGET_PATH", self.output_path.clone())
+      .args(xargo_flags)
+      //.status().map(|status| status.success())
+      .output()
+    {
+      Err(_) => panic!("failed to get xargo output"),
+      Ok(output) => {
+        if !output.status.success() {
+          println!("FATAL: xargo not successful");
+          println!();
+          println!("### BEGIN XARGO STDOUT ###");
+          print!("{}", from_utf8(&output.stdout).unwrap());
+          println!("### END XARGO STDOUT ###");
+          println!();
+          println!("### BEGIN XARGO STDERR ###");
+          print!("{}", from_utf8(&output.stderr).unwrap());
+          println!("### END XARGO STDERR ###");
+          panic!();
+        }
+      }
+    }
+
+    nvcc_flags.push("-O3".to_string());
+    nvcc_flags.push("-fatbin".to_string());
+
     Ok(Glue{})
   }
 }
@@ -123,7 +227,7 @@ pub struct Glue {
 }
 
 impl Glue {
-  pub fn write_to_file(self) -> Result<(), ()> {
+  pub fn write_to_file<P: Into<PathBuf>>(self, output_path: P) -> Result<(), ()> {
     // TODO
     //unimplemented!();
     Ok(())
