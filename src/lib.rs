@@ -1,11 +1,13 @@
+extern crate quote;
 extern crate syn;
 extern crate walkdir;
 
+use quote::{ToTokens};
 use walkdir::{WalkDir};
 
 use std::env;
 use std::fs::{self, File};
-use std::io::{Write};
+use std::io::{Read, Write};
 use std::path::{PathBuf};
 use std::process::{Command};
 use std::str::{from_utf8};
@@ -256,6 +258,72 @@ impl Builder {
           print!("{}", from_utf8(&output.stderr).unwrap());
           println!("### END NVCC STDERR ###");
           panic!();
+        }
+      }
+    }
+
+    let mut rs_paths = Vec::new();
+    for e in WalkDir::new(self.subcrate_path.clone().unwrap()) {
+      let e = e.unwrap();
+      if e.path().extension().and_then(|s| s.to_str()) == Some("rs") {
+        let rs_path = e.path();
+        println!("DEBUG: maybe rs path: {:?}", rs_path);
+        rs_paths.push(rs_path.to_owned());
+      }
+    }
+
+    for rs_path in rs_paths.iter() {
+      let mut rs_file = File::open(rs_path).unwrap();
+      let mut src_buf = String::new();
+      match rs_file.read_to_string(&mut src_buf) {
+        Err(_) => panic!("failed to read rust source file"),
+        Ok(_) => {}
+      }
+      let syntax = match syn::parse_file(&src_buf) {
+        Err(_) => panic!("failed to parse rust source file"),
+        Ok(syntax) => syntax,
+      };
+      for tl_item in syntax.items.iter() {
+        match tl_item {
+          &syn::Item::Fn(ref fun_item) => {
+            match &fun_item.abi {
+              &Some(ref abi) => {
+                if abi.name.as_ref().map(|s| s.value()) == Some("ptx-kernel".to_string()) {
+                  println!("DEBUG: found ptx-kernel: {}", fun_item.ident.to_string());
+                  for arg in fun_item.decl.inputs.iter() {
+                    match arg {
+                      &syn::FnArg::Captured(ref arg) => {
+                        match &arg.pat {
+                          &syn::Pat::Ident(ref pat) => {
+                            println!("DEBUG:   arg: {}", pat.ident.to_string());
+                          }
+                          _ => panic!("unsupported ptx-kernel function argument pattern"),
+                        }
+                        println!("DEBUG:     ty: {}", arg.ty.clone().into_token_stream().to_string());
+                        match &arg.ty {
+                          syn::Type::Ptr(ref _ptr) => {
+                            println!("DEBUG:       ty isptr");
+                          }
+                          _ => {}
+                        }
+                      }
+                      _ => panic!("unsupported ptx-kernel function argument"),
+                    }
+                  }
+                  match &fun_item.decl.output {
+                    &syn::ReturnType::Default => {
+                      println!("DEBUG:   ret ty: ()");
+                    }
+                    &syn::ReturnType::Type(_, ref ret_ty) => {
+                      println!("DEBUG:   ret ty: {}", ret_ty.clone().into_token_stream().to_string());
+                    }
+                  }
+                }
+              }
+              _ => {}
+            }
+          }
+          _ => {}
         }
       }
     }
