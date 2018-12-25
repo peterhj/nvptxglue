@@ -7,17 +7,103 @@ use walkdir::{WalkDir};
 
 use std::env;
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::{Read, Write, BufWriter, Result as IoResult};
 use std::path::{PathBuf};
 use std::process::{Command};
 use std::str::{from_utf8};
 
 pub mod prelude {
   pub use crate::{
+    GlueFun,
+    GlueSpec,
+    Glue,
+    CudaFfiGlue,
     Cc::*,
     Cc,
     Gencode,
   };
+}
+
+pub struct GlueFun {
+  pub name: String,
+  pub args: Vec<(String, String)>,
+  pub ret:  Option<String>,
+}
+
+pub struct GlueSpec {
+  pub fatbin:   PathBuf,
+  pub funs:     Vec<GlueFun>,
+}
+
+impl GlueSpec {
+  pub fn write_to_file<G: Glue, P: Into<PathBuf>>(self, glue: G, output_path: P) -> Result<GlueSpec, ()> {
+    let output_file = File::create(output_path.into()).unwrap();
+    let mut output_writer = BufWriter::new(output_file);
+    match glue.gen(&self, &mut output_writer) {
+      Err(_) => Err(()),
+      Ok(_) => Ok(self),
+    }
+  }
+}
+
+pub trait Glue {
+  fn gen(&self, spec: &GlueSpec, writer: &mut dyn Write) -> IoResult<()>;
+}
+
+#[derive(Default)]
+pub struct CudaFfiGlue {
+}
+
+impl Glue for CudaFfiGlue {
+  fn gen(&self, spec: &GlueSpec, writer: &mut dyn Write) -> IoResult<()> {
+    // TODO
+    writeln!(writer, "use std::os::raw::{{c_uint, c_void}};")?;
+    writeln!(writer, "use std::ptr::{{null_mut}};")?;
+    writeln!(writer, "")?;
+    writeln!(writer, "static _FATBIN_IMAGE: &'static [u8] = include_bytes!(\"{}\");", spec.fatbin.to_str().unwrap())?;
+    writeln!(writer, "")?;
+    writeln!(writer, "lazy_static! {{")?;
+    writeln!(writer, "}}")?;
+    writeln!(writer, "")?;
+    writeln!(writer, "thread_local! {{")?;
+    writeln!(writer, "}}")?;
+    writeln!(writer, "")?;
+    writeln!(writer, "#[inline]")?;
+    writeln!(writer, "fn _karg_pack<'a, T: Copy + 'static>(x: &'a T) -> *mut c_void {{")?;
+    writeln!(writer, "  x as *const T as *mut c_void")?;
+    writeln!(writer, "}}")?;
+    writeln!(writer, "")?;
+    for fun in spec.funs.iter() {
+      write!(writer, "pub unsafe fn {}<S: Into<((u32, u32, u32), (u32, u32, u32), u32)>>(", fun.name)?;
+      for &(ref arg_name, ref arg_ty) in fun.args.iter() {
+        write!(writer, "{}: {}, ", arg_name, arg_ty)?;
+      }
+      write!(writer, "shape: S, /*stream_ptr: CUstream*/")?;
+      match &fun.ret {
+        &None => writeln!(writer, ") {{")?,
+        &Some(ref ret_ty) => writeln!(writer, ") -> {} {{", ret_ty)?,
+      }
+      writeln!(writer, "  // TODO")?;
+      writeln!(writer, "  //let mut this_mod = ...;")?;
+      writeln!(writer, "  //let mut this_func = ...;")?;
+      writeln!(writer, "  let shape = shape.into();")?;
+      writeln!(writer, "  let mut arg_bufs: [*mut c_void; {}] = [null_mut(); {}];", fun.args.len() + 1, fun.args.len() + 1)?;
+      for (arg_rank, &(ref arg_name, _)) in fun.args.iter().enumerate() {
+        writeln!(writer, "  arg_bufs[{}] = _karg_pack(&{});", arg_rank, arg_name)?;
+      }
+      writeln!(writer, "  /*unsafe {{ cuLaunchKernel(")?;
+      writeln!(writer, "      this_func,")?;
+      writeln!(writer, "      shape.0.0 as c_uint, shape.0.1 as c_uint, shape.0.2 as c_uint,")?;
+      writeln!(writer, "      shape.1.0 as c_uint, shape.1.1 as c_uint, shape.1.2 as c_uint,")?;
+      writeln!(writer, "      shape.2 as c_uint,")?;
+      writeln!(writer, "      stream_ptr,")?;
+      writeln!(writer, "      &arg_bufs as &[*mut c_void] as *mut *mut c_void,")?;
+      writeln!(writer, "      null_mut()) }};*/")?;
+      writeln!(writer, "}}")?;
+      writeln!(writer, "")?;
+    }
+    Ok(())
+  }
 }
 
 fn build_nvptx_target_json(target_arch: &str) -> String {
@@ -90,17 +176,17 @@ impl Cc {
 
 #[derive(Debug)]
 pub enum Gencode {
-  Ptx(Cc),
-  Sass(Cc),
+  VGpu(Cc),
+  Gpu(Cc),
 }
 
 impl Gencode {
   pub fn target_arch_str(&self) -> &'static str {
     match self {
-      &Gencode::Ptx(ref cc) => {
+      &Gencode::VGpu(ref cc) => {
         cc.compute_str()
       }
-      &Gencode::Sass(ref cc) => {
+      &Gencode::Gpu(ref cc) => {
         cc.sm_str()
       }
     }
@@ -108,10 +194,10 @@ impl Gencode {
 
   pub fn flags(&self) -> Vec<String> {
     match self {
-      &Gencode::Ptx(ref cc) => {
+      &Gencode::VGpu(ref cc) => {
         vec!["-gencode".to_string(), format!("arch={},code={}", cc.compute_str(), cc.compute_str())]
       }
-      &Gencode::Sass(ref cc) => {
+      &Gencode::Gpu(ref cc) => {
         vec!["-gencode".to_string(), format!("arch={},code={}", cc.compute_str(), cc.sm_str())]
       }
     }
@@ -157,7 +243,7 @@ impl Builder {
     self
   }
 
-  pub fn generate(self) -> Result<Glue, ()> {
+  pub fn generate(self) -> Result<GlueSpec, ()> {
     // TODO
 
     for entry in WalkDir::new(self.subcrate_path.clone().unwrap().to_str().unwrap()) {
@@ -261,7 +347,10 @@ impl Builder {
         }
       }
     }
+    //let fatbin_path = self.output_path.join("some.fatbin");
+    let fatbin_path = self.output_path.join("kernels-978820336f5bb6e5.fatbin");
 
+    // FIXME: instead of using WalkDir, can read the dependency file.
     let mut rs_paths = Vec::new();
     for e in WalkDir::new(self.subcrate_path.clone().unwrap()) {
       let e = e.unwrap();
@@ -272,6 +361,7 @@ impl Builder {
       }
     }
 
+    let mut glue_funs = Vec::new();
     for rs_path in rs_paths.iter() {
       let mut rs_file = File::open(rs_path).unwrap();
       let mut src_buf = String::new();
@@ -290,34 +380,46 @@ impl Builder {
               &Some(ref abi) => {
                 if abi.name.as_ref().map(|s| s.value()) == Some("ptx-kernel".to_string()) {
                   println!("DEBUG: found ptx-kernel: {}", fun_item.ident.to_string());
+                  let name = fun_item.ident.to_string();
+                  let mut args = Vec::new();
                   for arg in fun_item.decl.inputs.iter() {
                     match arg {
                       &syn::FnArg::Captured(ref arg) => {
-                        match &arg.pat {
+                        let arg_name = match &arg.pat {
                           &syn::Pat::Ident(ref pat) => {
                             println!("DEBUG:   arg: {}", pat.ident.to_string());
+                            pat.ident.to_string()
                           }
                           _ => panic!("unsupported ptx-kernel function argument pattern"),
-                        }
+                        };
                         println!("DEBUG:     ty: {}", arg.ty.clone().into_token_stream().to_string());
+                        let arg_ty = arg.ty.clone().into_token_stream().to_string();
                         match &arg.ty {
                           syn::Type::Ptr(ref _ptr) => {
                             println!("DEBUG:       ty isptr");
                           }
                           _ => {}
                         }
+                        args.push((arg_name, arg_ty));
                       }
                       _ => panic!("unsupported ptx-kernel function argument"),
                     }
                   }
-                  match &fun_item.decl.output {
+                  let ret = match &fun_item.decl.output {
                     &syn::ReturnType::Default => {
                       println!("DEBUG:   ret ty: ()");
+                      None
                     }
                     &syn::ReturnType::Type(_, ref ret_ty) => {
                       println!("DEBUG:   ret ty: {}", ret_ty.clone().into_token_stream().to_string());
+                      Some(ret_ty.clone().into_token_stream().to_string())
                     }
-                  }
+                  };
+                  glue_funs.push(GlueFun{
+                    name,
+                    args,
+                    ret,
+                  });
                 }
               }
               _ => {}
@@ -328,17 +430,9 @@ impl Builder {
       }
     }
 
-    Ok(Glue{})
-  }
-}
-
-pub struct Glue {
-}
-
-impl Glue {
-  pub fn write_to_file<P: Into<PathBuf>>(self, output_path: P) -> Result<(), ()> {
-    // TODO
-    //unimplemented!();
-    Ok(())
+    Ok(GlueSpec{
+      fatbin:   fatbin_path,
+      funs:     glue_funs,
+    })
   }
 }

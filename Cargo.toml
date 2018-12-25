@@ -9,6 +9,6 @@ name = "nvptxglue"
 path = "src/lib.rs"
 
 [dependencies]
-quote = "*"
-syn = { version = "*", features = ["full"] }
-walkdir = "*"
+quote = "^0.6"
+syn = { version = "^0.15", features = ["full"] }
+walkdir = "^2"
