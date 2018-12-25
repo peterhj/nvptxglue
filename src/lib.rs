@@ -4,7 +4,7 @@ extern crate walkdir;
 use walkdir::{WalkDir};
 
 use std::env;
-use std::fs::{File};
+use std::fs::{self, File};
 use std::io::{Write};
 use std::path::{PathBuf};
 use std::process::{Command};
@@ -164,7 +164,7 @@ impl Builder {
     }
 
     let mut xargo_flags: Vec<String> = Vec::new();
-    let mut nvcc_flags: Vec<String> = Vec::new();
+    //let mut nvcc_flags: Vec<String> = Vec::new();
 
     println!("DEBUG: Builder::generate(): gencodes: {:?}", self.gencodes);
     assert_eq!(self.gencodes.len(), 1);
@@ -182,21 +182,23 @@ impl Builder {
     xargo_flags.push("--target".to_string());
     //xargo_flags.push(format!("nvptx64-nvidia-cuda-{}", self.gencodes[0].target_arch_str()));
     xargo_flags.push(format!("nvptx64-nvidia-cuda"));
+    //xargo_flags.push("-C".to_string());
+    //xargo_flags.push("target-cpu=sm_61".to_string());
     xargo_flags.push("--release".to_string());
     xargo_flags.push("--".to_string());
     xargo_flags.push("--emit=asm".to_string());
 
     let mut gencode_flags: Vec<String> = self.gencodes.iter().flat_map(|gencode| gencode.flags()).collect();
     println!("DEBUG:   gencode flags: {:?}", gencode_flags);
-    nvcc_flags.append(&mut gencode_flags);
+    //nvcc_flags.append(&mut gencode_flags);
 
     println!("DEBUG: target path: {:?}", self.output_path.clone());
     match Command::new("xargo")
       //.current_dir(self.output_path.clone())
       .current_dir(self.subcrate_path.clone().unwrap())
       .env("RUST_TARGET_PATH", self.output_path.clone())
+      //.env("RUSTFLAGS", "-C target-cpu=sm_61")
       .args(xargo_flags)
-      //.status().map(|status| status.success())
       .output()
     {
       Err(_) => panic!("failed to get xargo output"),
@@ -216,8 +218,47 @@ impl Builder {
       }
     }
 
-    nvcc_flags.push("-O3".to_string());
-    nvcc_flags.push("-fatbin".to_string());
+    let mut ptx_paths = Vec::new();
+    for e in WalkDir::new(self.subcrate_path.clone().unwrap().join("target").join("nvptx64-nvidia-cuda").join("release").join("deps")) {
+      let e = e.unwrap();
+      if e.path().extension().and_then(|s| s.to_str()) == Some("s") {
+        let asm_path = e.path();
+        println!("DEBUG: maybe emitted ptx path: {:?}", asm_path);
+        let mut ptx_path = asm_path.to_owned();
+        ptx_path.set_extension("ptx");
+        match fs::copy(asm_path, &ptx_path) {
+          Err(_) => panic!("failed to copy .s file to .ptx file"),
+          Ok(_) => {}
+        }
+        ptx_paths.push(ptx_path);
+      }
+    }
+    assert_eq!(ptx_paths.len(), 1);
+
+    match Command::new("/usr/local/cuda/bin/nvcc")
+      .current_dir(self.output_path.clone())
+      .arg("-O3")
+      .arg("-fatbin")
+      .args(gencode_flags)
+      .arg(fs::canonicalize(&ptx_paths[0]).unwrap())
+      .output()
+    {
+      Err(_) => panic!("failed to get nvcc output"),
+      Ok(output) => {
+        if !output.status.success() {
+          println!("FATAL: nvcc not successful");
+          println!();
+          println!("### BEGIN NVCC STDOUT ###");
+          print!("{}", from_utf8(&output.stdout).unwrap());
+          println!("### END NVCC STDOUT ###");
+          println!();
+          println!("### BEGIN NVCC STDERR ###");
+          print!("{}", from_utf8(&output.stderr).unwrap());
+          println!("### END NVCC STDERR ###");
+          panic!();
+        }
+      }
+    }
 
     Ok(Glue{})
   }
