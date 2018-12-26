@@ -28,6 +28,7 @@ pub struct GlueFun {
   pub name: String,
   pub args: Vec<(String, String)>,
   pub ret:  Option<String>,
+  pub coop: bool,
 }
 
 pub struct GlueSpec {
@@ -39,7 +40,7 @@ impl GlueSpec {
   pub fn write_to_file<G: Glue, P: Into<PathBuf>>(self, glue: G, output_path: P) -> Result<GlueSpec, ()> {
     let output_file = File::create(output_path.into()).unwrap();
     let mut output_writer = BufWriter::new(output_file);
-    match glue.gen(&self, &mut output_writer) {
+    match glue.write_bindings(&self, &mut output_writer) {
       Err(_) => Err(()),
       Ok(_) => Ok(self),
     }
@@ -47,7 +48,7 @@ impl GlueSpec {
 }
 
 pub trait Glue {
-  fn gen(&self, spec: &GlueSpec, writer: &mut dyn Write) -> IoResult<()>;
+  fn write_bindings(&self, spec: &GlueSpec, writer: &mut dyn Write) -> IoResult<()>;
 }
 
 #[derive(Default)]
@@ -55,50 +56,85 @@ pub struct CudaFfiGlue {
 }
 
 impl Glue for CudaFfiGlue {
-  fn gen(&self, spec: &GlueSpec, writer: &mut dyn Write) -> IoResult<()> {
+  fn write_bindings(&self, spec: &GlueSpec, writer: &mut dyn Write) -> IoResult<()> {
     // TODO
+    writeln!(writer, "use cuda_ffi_types::cuda::{{CUfunction, CUmodule, CUstream}};")?;
+    writeln!(writer, "use cuda::ffi::{{cuLaunchKernel, cuModuleGetFunction, cuModuleLoadFatBinary}};")?;
+    writeln!(writer, "use std::cell::{{RefCell}};")?;
+    writeln!(writer, "use std::ffi::{{CString}};")?;
     writeln!(writer, "use std::os::raw::{{c_uint, c_void}};")?;
     writeln!(writer, "use std::ptr::{{null_mut}};")?;
     writeln!(writer, "")?;
-    writeln!(writer, "static _FATBIN_IMAGE: &'static [u8] = include_bytes!(\"{}\");", spec.fatbin.to_str().unwrap())?;
-    writeln!(writer, "")?;
-    writeln!(writer, "lazy_static! {{")?;
-    writeln!(writer, "}}")?;
+    writeln!(writer, "static _THIS_FATBIN_IMAGE: &'static [u8] = include_bytes!(\"{}\");", spec.fatbin.to_str().unwrap())?;
     writeln!(writer, "")?;
     writeln!(writer, "thread_local! {{")?;
+    writeln!(writer, "  static _THIS_HMOD: RefCell<_ThisHmod> = RefCell::new(_ThisHmod::default());")?;
+    writeln!(writer, "}}")?;
+    writeln!(writer, "")?;
+    //writeln!(writer, "#[derive(Default)]")?;
+    writeln!(writer, "struct _ThisHmod {{")?;
+    writeln!(writer, "  hmod_ptr: CUmodule,")?;
+    for fun in spec.funs.iter() {
+      writeln!(writer, "  _{}: CUfunction,", fun.name)?;
+    }
+    writeln!(writer, "}}")?;
+    writeln!(writer, "")?;
+    writeln!(writer, "impl Default for _ThisHmod {{")?;
+    writeln!(writer, "  fn default() -> _ThisHmod {{")?;
+    writeln!(writer, "    _ThisHmod{{")?;
+    writeln!(writer, "      hmod_ptr: null_mut(),")?;
+    for fun in spec.funs.iter() {
+      writeln!(writer, "      _{}: null_mut(),", fun.name)?;
+    }
+    writeln!(writer, "    }}")?;
+    writeln!(writer, "  }}")?;
     writeln!(writer, "}}")?;
     writeln!(writer, "")?;
     writeln!(writer, "#[inline]")?;
-    writeln!(writer, "fn _karg_pack<'a, T: Copy + 'static>(x: &'a T) -> *mut c_void {{")?;
+    writeln!(writer, "fn _pack_kparam<'a, T: Copy + 'static>(x: &'a T) -> *mut c_void {{")?;
     writeln!(writer, "  x as *const T as *mut c_void")?;
     writeln!(writer, "}}")?;
     writeln!(writer, "")?;
     for fun in spec.funs.iter() {
-      write!(writer, "pub unsafe fn {}<S: Into<((u32, u32, u32), (u32, u32, u32), u32)>>(", fun.name)?;
+      write!(writer, "pub unsafe fn {}<_KShape: Into<((u32, u32, u32), (u32, u32, u32), u32)>>(", fun.name)?;
       for &(ref arg_name, ref arg_ty) in fun.args.iter() {
         write!(writer, "{}: {}, ", arg_name, arg_ty)?;
       }
-      write!(writer, "shape: S, /*stream_ptr: CUstream*/")?;
+      write!(writer, "_kshape: _KShape, _stream_ptr: CUstream")?;
       match &fun.ret {
         &None => writeln!(writer, ") {{")?,
         &Some(ref ret_ty) => writeln!(writer, ") -> {} {{", ret_ty)?,
       }
-      writeln!(writer, "  // TODO")?;
-      writeln!(writer, "  //let mut this_mod = ...;")?;
-      writeln!(writer, "  //let mut this_func = ...;")?;
-      writeln!(writer, "  let shape = shape.into();")?;
-      writeln!(writer, "  let mut arg_bufs: [*mut c_void; {}] = [null_mut(); {}];", fun.args.len() + 1, fun.args.len() + 1)?;
+      writeln!(writer, "  let _kshape = _kshape.into();")?;
+      writeln!(writer, "  let mut _kparams: [*mut c_void; {}] = [null_mut(); {}];", fun.args.len(), fun.args.len())?;
       for (arg_rank, &(ref arg_name, _)) in fun.args.iter().enumerate() {
-        writeln!(writer, "  arg_bufs[{}] = _karg_pack(&{});", arg_rank, arg_name)?;
+        writeln!(writer, "  _kparams[{}] = _pack_kparam(&{});", arg_rank, arg_name)?;
       }
-      writeln!(writer, "  /*unsafe {{ cuLaunchKernel(")?;
-      writeln!(writer, "      this_func,")?;
-      writeln!(writer, "      shape.0.0 as c_uint, shape.0.1 as c_uint, shape.0.2 as c_uint,")?;
-      writeln!(writer, "      shape.1.0 as c_uint, shape.1.1 as c_uint, shape.1.2 as c_uint,")?;
-      writeln!(writer, "      shape.2 as c_uint,")?;
-      writeln!(writer, "      stream_ptr,")?;
-      writeln!(writer, "      &arg_bufs as &[*mut c_void] as *mut *mut c_void,")?;
-      writeln!(writer, "      null_mut()) }};*/")?;
+      writeln!(writer, "  let this_func_ptr = _THIS_HMOD.with(|this_hmod| {{")?;
+      writeln!(writer, "    let mut this_hmod = this_hmod.borrow_mut();")?;
+      writeln!(writer, "    if this_hmod._{}.is_null() {{", fun.name)?;
+      writeln!(writer, "      if this_hmod.hmod_ptr.is_null() {{")?;
+      writeln!(writer, "        let mut hmod_ptr: CUmodule = null_mut();")?;
+      writeln!(writer, "        cuModuleLoadFatBinary(&mut hmod_ptr as *mut CUmodule, _THIS_FATBIN_IMAGE.as_ptr() as *const c_void);")?;
+      writeln!(writer, "        assert!(!hmod_ptr.is_null());")?;
+      writeln!(writer, "        this_hmod.hmod_ptr = hmod_ptr;")?;
+      writeln!(writer, "      }}")?;
+      writeln!(writer, "      let func_name = CString::new(\"{}\").unwrap();", fun.name)?;
+      writeln!(writer, "      let mut func_ptr: CUfunction = null_mut();")?;
+      writeln!(writer, "      cuModuleGetFunction(&mut func_ptr as *mut CUfunction, this_hmod.hmod_ptr, func_name.as_ptr());")?;
+      writeln!(writer, "      assert!(!func_ptr.is_null());")?;
+      writeln!(writer, "      this_hmod._{} = func_ptr;", fun.name)?;
+      writeln!(writer, "    }}")?;
+      writeln!(writer, "    this_hmod._{}", fun.name)?;
+      writeln!(writer, "  }});")?;
+      writeln!(writer, "  cuLaunchKernel(")?;
+      writeln!(writer, "      this_func_ptr,")?;
+      writeln!(writer, "      (_kshape.0).0 as c_uint, (_kshape.0).1 as c_uint, (_kshape.0).2 as c_uint,")?;
+      writeln!(writer, "      (_kshape.1).0 as c_uint, (_kshape.1).1 as c_uint, (_kshape.1).2 as c_uint,")?;
+      writeln!(writer, "      _kshape.2 as c_uint,")?;
+      writeln!(writer, "      _stream_ptr,")?;
+      writeln!(writer, "      (&_kparams as &[*mut c_void]).as_ptr() as *mut *mut c_void,")?;
+      writeln!(writer, "      null_mut());")?;
       writeln!(writer, "}}")?;
       writeln!(writer, "")?;
     }
@@ -204,12 +240,17 @@ impl Gencode {
   }
 }
 
+struct Kernel {
+  name: String,
+  coop: bool,
+}
+
 pub struct Builder {
   root_path:        PathBuf,
   output_path:      PathBuf,
   subcrate_path:    Option<PathBuf>,
   gencodes:         Vec<Gencode>,
-  kernels:          Vec<String>,
+  kernels:          Vec<Kernel>,
 }
 
 impl Default for Builder {
@@ -238,8 +279,19 @@ impl Builder {
     self
   }
 
-  pub fn whitelist_kernel<S: Into<String>>(mut self, kernel: S) -> Builder {
-    self.kernels.push(kernel.into());
+  pub fn whitelist_kernel<S: Into<String>>(mut self, kernel_name: S) -> Builder {
+    self.kernels.push(Kernel{
+      name: kernel_name.into(),
+      coop: false,
+    });
+    self
+  }
+
+  pub fn whitelist_coop_kernel<S: Into<String>>(mut self, kernel_name: S) -> Builder {
+    self.kernels.push(Kernel{
+      name: kernel_name.into(),
+      coop: true,
+    });
     self
   }
 
@@ -379,6 +431,7 @@ impl Builder {
             match &fun_item.abi {
               &Some(ref abi) => {
                 if abi.name.as_ref().map(|s| s.value()) == Some("ptx-kernel".to_string()) {
+                  // FIXME: crosscheck with whitelisted kernel set.
                   println!("DEBUG: found ptx-kernel: {}", fun_item.ident.to_string());
                   let name = fun_item.ident.to_string();
                   let mut args = Vec::new();
@@ -419,6 +472,7 @@ impl Builder {
                     name,
                     args,
                     ret,
+                    coop:   false,
                   });
                 }
               }
