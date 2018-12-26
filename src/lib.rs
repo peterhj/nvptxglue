@@ -37,7 +37,7 @@ pub struct GlueSpec {
 }
 
 impl GlueSpec {
-  pub fn write_to_file<G: Glue, P: Into<PathBuf>>(self, glue: G, output_path: P) -> Result<GlueSpec, ()> {
+  pub fn write_bindings_to_file<G: Glue, P: Into<PathBuf>>(self, glue: G, output_path: P) -> Result<GlueSpec, ()> {
     let output_file = File::create(output_path.into()).unwrap();
     let mut output_writer = BufWriter::new(output_file);
     match glue.write_bindings(&self, &mut output_writer) {
@@ -57,7 +57,6 @@ pub struct CudaFfiGlue {
 
 impl Glue for CudaFfiGlue {
   fn write_bindings(&self, spec: &GlueSpec, writer: &mut dyn Write) -> IoResult<()> {
-    // TODO
     writeln!(writer, "use cuda_ffi_types::cuda::{{CUfunction, CUmodule, CUstream}};")?;
     writeln!(writer, "use cuda::ffi::{{cuLaunchKernel, cuModuleGetFunction, cuModuleLoadFatBinary}};")?;
     writeln!(writer, "use std::cell::{{RefCell}};")?;
@@ -139,6 +138,16 @@ impl Glue for CudaFfiGlue {
       writeln!(writer, "")?;
     }
     Ok(())
+  }
+}
+
+#[derive(Default)]
+pub struct RustacudaGlue {
+}
+
+impl Glue for RustacudaGlue {
+  fn write_bindings(&self, _spec: &GlueSpec, _writer: &mut dyn Write) -> IoResult<()> {
+    unimplemented!();
   }
 }
 
@@ -249,19 +258,20 @@ pub struct Builder {
   root_path:        PathBuf,
   output_path:      PathBuf,
   subcrate_path:    Option<PathBuf>,
+  ptx_linker:       bool,
   gencodes:         Vec<Gencode>,
   kernels:          Vec<Kernel>,
 }
 
 impl Default for Builder {
   fn default() -> Builder {
-    // TODO
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     Builder{
       root_path:        manifest_dir,
       output_path:      out_dir,
       subcrate_path:    None,
+      ptx_linker:       false,
       gencodes:         Vec::new(),
       kernels:          Vec::new(),
     }
@@ -271,6 +281,11 @@ impl Default for Builder {
 impl Builder {
   pub fn crate_dir<P: Into<PathBuf>>(mut self, subcrate_path: P) -> Builder {
     self.subcrate_path = Some(subcrate_path.into());
+    self
+  }
+
+  pub fn ptx_linker(mut self, enabled: bool) -> Builder {
+    self.ptx_linker = enabled;
     self
   }
 
@@ -295,23 +310,15 @@ impl Builder {
     self
   }
 
-  pub fn generate(self) -> Result<GlueSpec, ()> {
-    // TODO
-
-    for entry in WalkDir::new(self.subcrate_path.clone().unwrap().to_str().unwrap()) {
-      let entry = entry.unwrap();
-      println!("cargo:rerun-if-changed={}", entry.path().display());
-    }
-
+  fn run_xargo(&self) {
     let mut xargo_flags: Vec<String> = Vec::new();
-    //let mut nvcc_flags: Vec<String> = Vec::new();
 
     println!("DEBUG: Builder::generate(): gencodes: {:?}", self.gencodes);
-    assert_eq!(self.gencodes.len(), 1);
+    assert_eq!(self.gencodes.len(), 1,
+        "todo: compiling multiple ptx files into a fatbin");
     let target_json = build_nvptx_target_json(self.gencodes[0].target_arch_str());
-    println!("DEBUG:   target json: {}", target_json);
+    println!("DEBUG: target json: {}", target_json);
     {
-      //let mut target_json_file = File::create(self.output_path.join(format!("nvptx64-nvidia-cuda-{}.json", self.gencodes[0].target_arch_str()))).unwrap();
       let mut target_json_file = File::create(self.output_path.join(format!("nvptx64-nvidia-cuda.json"))).unwrap();
       target_json_file.write_all(target_json.as_bytes()).unwrap();
     }
@@ -319,18 +326,14 @@ impl Builder {
     xargo_flags.push("rustc".to_string());
     //xargo_flags.push("--manifest-path".to_string());
     //xargo_flags.push(self.subcrate_path.clone().unwrap().join("Cargo.toml").as_os_str().to_str().unwrap().to_string());
+    // FIXME: GPU arch-specific target path.
     xargo_flags.push("--target".to_string());
-    //xargo_flags.push(format!("nvptx64-nvidia-cuda-{}", self.gencodes[0].target_arch_str()));
     xargo_flags.push(format!("nvptx64-nvidia-cuda"));
     //xargo_flags.push("-C".to_string());
     //xargo_flags.push("target-cpu=sm_61".to_string());
     xargo_flags.push("--release".to_string());
     xargo_flags.push("--".to_string());
     xargo_flags.push("--emit=asm".to_string());
-
-    let mut gencode_flags: Vec<String> = self.gencodes.iter().flat_map(|gencode| gencode.flags()).collect();
-    println!("DEBUG:   gencode flags: {:?}", gencode_flags);
-    //nvcc_flags.append(&mut gencode_flags);
 
     println!("DEBUG: target path: {:?}", self.output_path.clone());
     match Command::new("xargo")
@@ -357,8 +360,15 @@ impl Builder {
         }
       }
     }
+  }
 
+  fn run_xargo_with_ptx_linker(&self) {
+    unimplemented!();
+  }
+
+  fn run_nvcc(&self) -> PathBuf {
     let mut ptx_paths = Vec::new();
+    let mut fatbin_paths = Vec::new();
     for e in WalkDir::new(self.subcrate_path.clone().unwrap().join("target").join("nvptx64-nvidia-cuda").join("release").join("deps")) {
       let e = e.unwrap();
       if e.path().extension().and_then(|s| s.to_str()) == Some("s") {
@@ -370,10 +380,16 @@ impl Builder {
           Err(_) => panic!("failed to copy .s file to .ptx file"),
           Ok(_) => {}
         }
+        let mut fatbin_path = self.output_path.join(ptx_path.file_name().unwrap());
+        fatbin_path.set_extension("fatbin");
         ptx_paths.push(ptx_path);
+        fatbin_paths.push(fatbin_path);
       }
     }
     assert_eq!(ptx_paths.len(), 1);
+
+    let gencode_flags: Vec<String> = self.gencodes.iter().flat_map(|gencode| gencode.flags()).collect();
+    println!("DEBUG: gencode flags: {:?}", gencode_flags);
 
     match Command::new("/usr/local/cuda/bin/nvcc")
       .current_dir(self.output_path.clone())
@@ -399,8 +415,22 @@ impl Builder {
         }
       }
     }
-    //let fatbin_path = self.output_path.join("some.fatbin");
-    let fatbin_path = self.output_path.join("kernels-978820336f5bb6e5.fatbin");
+
+    fatbin_paths[0].clone()
+  }
+
+  pub fn compile_fatbin(self) -> Result<GlueSpec, ()> {
+    for entry in WalkDir::new(self.subcrate_path.clone().unwrap().to_str().unwrap()) {
+      let entry = entry.unwrap();
+      println!("cargo:rerun-if-changed={}", entry.path().display());
+    }
+
+    match self.ptx_linker {
+      false => self.run_xargo(),
+      true  => self.run_xargo_with_ptx_linker(),
+    }
+
+    let fatbin_path = self.run_nvcc();
 
     // FIXME: instead of using WalkDir, can read the dependency file.
     let mut rs_paths = Vec::new();

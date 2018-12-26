@@ -4,11 +4,11 @@ version = "0.0.0"
 edition = "2018"
 authors = ["Peter Jin <peterhaijin@gmail.com>"]
 
-[lib]
-name = "nvptxglue"
-path = "src/lib.rs"
-
 [dependencies]
 quote = "^0.6"
 syn = { version = "^0.15", features = ["full"] }
 walkdir = "^2"
+
+[lib]
+name = "nvptxglue"
+path = "src/lib.rs"

@@ -6,3 +6,21 @@ Unlike `bindgen`, `nvptxglue` effectively cross-compiles a Rust subcrate for a
 [`xargo`](https://github.com/japaric/xargo), and `nvcc`), while the generated
 glue bindings are from Rust to Rust (using
 [`syn`](https://github.com/dtolnay/syn)).
+
+## Related projects
+
+Like [`ptx-builder`](https://github.com/denzp/rust-ptx-linker), `nvptxglue` is
+meant to be used in build scripts to facilitate the use of NVPTX-targeted
+Rust crates in the host crate. However unlike `ptx-builder`, `nvptxglue` aims to
+replicate parts of the the "native" CUDA toolchain, based on nvcc, to compile
+_fat binaries_ that support multiple real or virtual GPU architectures.
+
+[`ptx-linker`](https://github.com/denzp/rust-ptx-linker) uses LLVM to get around
+some limitations of rustc's NVPTX target support. `nvptxglue` can use
+`ptx-linker` during the "xargo phase" (todo).
+
+[RustaCUDA](https://github.com/bheisler/rustacuda) is a high-level interface for
+safely launching CUDA kernels via the driver API in Rust. `nvptxglue` can
+generate RustaCUDA-compatible Rust bindings: what is needed is an implementation
+of the `Glue` trait to emit the generated Rust code to an arbitrary writer
+(todo; I reserved a `RustacudaGlue` type for this).
