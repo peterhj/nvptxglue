@@ -2,7 +2,7 @@
 utility for building Rust code and generating glue for `*-nvidia-cuda` targets.
 Like `bindgen`, `nvptxglue` is used in build scripts to generate Rust bindings.
 Unlike `bindgen`, `nvptxglue` effectively cross-compiles a Rust subcrate for a
-`*-nvidia-cuda` target (using the NVPTX backend,
+`*-nvidia-cuda` target (using combinations of: the NVPTX backend,
 [`xargo`](https://github.com/japaric/xargo), and `nvcc`), while the generated
 glue bindings are from Rust to Rust (using
 [`syn`](https://github.com/dtolnay/syn)).
@@ -12,8 +12,10 @@ glue bindings are from Rust to Rust (using
 Like [`ptx-builder`](https://github.com/denzp/rust-ptx-linker), `nvptxglue` is
 meant to be used in build scripts to facilitate the use of NVPTX-targeted
 Rust crates in the host crate. However unlike `ptx-builder`, `nvptxglue` aims to
-replicate parts of the the "native" CUDA toolchain, based on nvcc, to compile
-_fat binaries_ that support multiple real or virtual GPU architectures.
+enable finer grained control of the CUDA compilation lifecycle, e.g. generating
+only PTX from Rust and making the PTX available in a host crate, or replicating
+the "native" CUDA toolchain, based on nvcc, to compile _fat binaries_ that
+support multiple real or virtual GPU architectures.
 
 [`ptx-linker`](https://github.com/denzp/rust-ptx-linker) uses LLVM to get around
 some limitations of rustc's NVPTX target support. `nvptxglue` can use

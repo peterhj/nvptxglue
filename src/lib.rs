@@ -21,6 +21,8 @@ pub mod prelude {
     Cc::*,
     Cc,
     Gencode,
+    Phase,
+    CompilerOutput,
   };
 }
 
@@ -32,7 +34,7 @@ pub struct GlueFun {
 }
 
 pub struct GlueSpec {
-  pub fatbin:   PathBuf,
+  pub output:   CompilerOutput,
   pub funs:     Vec<GlueFun>,
 }
 
@@ -57,6 +59,10 @@ pub struct CudaFfiGlue {
 
 impl Glue for CudaFfiGlue {
   fn write_bindings(&self, spec: &GlueSpec, writer: &mut dyn Write) -> IoResult<()> {
+    let fatbin_path = match &spec.output {
+      &CompilerOutput::Fatbin(ref path) => path.to_str().unwrap(),
+      _ => panic!(),
+    };
     writeln!(writer, "use cuda_ffi_types::cuda::{{CUfunction, CUmodule, CUstream}};")?;
     writeln!(writer, "use cuda::ffi::{{cuLaunchKernel, cuModuleGetFunction, cuModuleLoadFatBinary}};")?;
     writeln!(writer, "use std::cell::{{RefCell}};")?;
@@ -64,7 +70,7 @@ impl Glue for CudaFfiGlue {
     writeln!(writer, "use std::os::raw::{{c_uint, c_void}};")?;
     writeln!(writer, "use std::ptr::{{null_mut}};")?;
     writeln!(writer, "")?;
-    writeln!(writer, "static _THIS_FATBIN_IMAGE: &'static [u8] = include_bytes!(\"{}\");", spec.fatbin.to_str().unwrap())?;
+    writeln!(writer, "static _THIS_FATBIN_IMAGE: &'static [u8] = include_bytes!(\"{}\");", fatbin_path)?;
     writeln!(writer, "")?;
     writeln!(writer, "thread_local! {{")?;
     writeln!(writer, "  static _THIS_HMOD: RefCell<_ThisHmod> = RefCell::new(_ThisHmod::default());")?;
@@ -151,11 +157,11 @@ impl Glue for RustacudaGlue {
   }
 }
 
-fn build_nvptx_target_json(target_arch: &str) -> String {
+fn build_nvptx_target_json(target_cpu: &str) -> String {
   format!("{{
   \"arch\": \"nvptx64\"
 , \"cpu\": \"{}\"
-, \"data-layout\": \"e-i64:64-v16:16-v32:32-n16:32:64\"
+, \"data-layout\": \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v32:32:32-v64:64:64-v128:128:128-n16:32:64\"
 , \"linker\": false
 , \"linker-flavor\": \"ld\"
 , \"llvm-target\": \"nvptx64-nvidia-cuda\"
@@ -166,7 +172,7 @@ fn build_nvptx_target_json(target_arch: &str) -> String {
 , \"target-c-int-width\": \"32\"
 , \"target-endian\": \"little\"
 , \"target-pointer-width\": \"64\"
-}}\n", target_arch)
+}}\n", target_cpu)
 }
 
 #[allow(non_camel_case_types)]
@@ -221,15 +227,15 @@ impl Cc {
 
 #[derive(Debug)]
 pub enum Gencode {
-  VGpu(Cc),
+  Ptx(Cc),
   Gpu(Cc),
 }
 
 impl Gencode {
-  pub fn target_arch_str(&self) -> &'static str {
+  pub fn llvm_target_cpu_str(&self) -> &'static str {
     match self {
-      &Gencode::VGpu(ref cc) => {
-        cc.compute_str()
+      &Gencode::Ptx(ref cc) => {
+        cc.sm_str()
       }
       &Gencode::Gpu(ref cc) => {
         cc.sm_str()
@@ -239,7 +245,7 @@ impl Gencode {
 
   pub fn flags(&self) -> Vec<String> {
     match self {
-      &Gencode::VGpu(ref cc) => {
+      &Gencode::Ptx(ref cc) => {
         vec!["-gencode".to_string(), format!("arch={},code={}", cc.compute_str(), cc.compute_str())]
       }
       &Gencode::Gpu(ref cc) => {
@@ -247,6 +253,20 @@ impl Gencode {
       }
     }
   }
+}
+
+#[derive(Debug)]
+pub enum Phase {
+  Ptx,
+  Cubin,
+  Fatbin,
+}
+
+#[derive(Debug)]
+pub enum CompilerOutput {
+  Ptx(PathBuf),
+  Cubin(PathBuf),
+  Fatbin(PathBuf),
 }
 
 struct Kernel {
@@ -316,7 +336,7 @@ impl Builder {
     println!("DEBUG: Builder::generate(): gencodes: {:?}", self.gencodes);
     assert_eq!(self.gencodes.len(), 1,
         "todo: compiling multiple ptx files into a fatbin");
-    let target_json = build_nvptx_target_json(self.gencodes[0].target_arch_str());
+    let target_json = build_nvptx_target_json(self.gencodes[0].llvm_target_cpu_str());
     println!("DEBUG: target json: {}", target_json);
     {
       let mut target_json_file = File::create(self.output_path.join(format!("nvptx64-nvidia-cuda.json"))).unwrap();
@@ -366,7 +386,12 @@ impl Builder {
     unimplemented!();
   }
 
-  fn run_nvcc(&self) -> PathBuf {
+  fn run_compiler(&self, phase: Phase) -> CompilerOutput {
+    match self.ptx_linker {
+      false => self.run_xargo(),
+      true  => self.run_xargo_with_ptx_linker(),
+    }
+
     let mut ptx_paths = Vec::new();
     let mut fatbin_paths = Vec::new();
     for e in WalkDir::new(self.subcrate_path.clone().unwrap().join("target").join("nvptx64-nvidia-cuda").join("release").join("deps")) {
@@ -386,51 +411,56 @@ impl Builder {
         fatbin_paths.push(fatbin_path);
       }
     }
+    // TODO: support for multiple compilation units.
     assert_eq!(ptx_paths.len(), 1);
 
     let gencode_flags: Vec<String> = self.gencodes.iter().flat_map(|gencode| gencode.flags()).collect();
     println!("DEBUG: gencode flags: {:?}", gencode_flags);
 
-    match Command::new("/usr/local/cuda/bin/nvcc")
-      .current_dir(self.output_path.clone())
-      .arg("-O3")
-      .arg("-fatbin")
-      .args(gencode_flags)
-      .arg(fs::canonicalize(&ptx_paths[0]).unwrap())
-      .output()
-    {
-      Err(_) => panic!("failed to get nvcc output"),
-      Ok(output) => {
-        if !output.status.success() {
-          println!("FATAL: nvcc not successful");
-          println!();
-          println!("### BEGIN NVCC STDOUT ###");
-          print!("{}", from_utf8(&output.stdout).unwrap());
-          println!("### END NVCC STDOUT ###");
-          println!();
-          println!("### BEGIN NVCC STDERR ###");
-          print!("{}", from_utf8(&output.stderr).unwrap());
-          println!("### END NVCC STDERR ###");
-          panic!();
+    match phase {
+      Phase::Ptx => {
+        CompilerOutput::Ptx(fs::canonicalize(&ptx_paths[0]).unwrap())
+      }
+      Phase::Cubin => {
+        unimplemented!();
+      }
+      Phase::Fatbin => {
+        match Command::new("/usr/local/cuda/bin/nvcc")
+          .current_dir(self.output_path.clone())
+          .arg("-O3")
+          .arg("-fatbin")
+          .args(gencode_flags)
+          .arg(fs::canonicalize(&ptx_paths[0]).unwrap())
+          .output()
+        {
+          Err(_) => panic!("failed to get nvcc output"),
+          Ok(output) => {
+            if !output.status.success() {
+              println!("FATAL: nvcc not successful");
+              println!();
+              println!("### BEGIN NVCC STDOUT ###");
+              print!("{}", from_utf8(&output.stdout).unwrap());
+              println!("### END NVCC STDOUT ###");
+              println!();
+              println!("### BEGIN NVCC STDERR ###");
+              print!("{}", from_utf8(&output.stderr).unwrap());
+              println!("### END NVCC STDERR ###");
+              panic!();
+            }
+          }
         }
+        CompilerOutput::Fatbin(fatbin_paths[0].clone())
       }
     }
-
-    fatbin_paths[0].clone()
   }
 
-  pub fn compile_fatbin(self) -> Result<GlueSpec, ()> {
+  pub fn compile(self, phase: Phase) -> Result<GlueSpec, ()> {
     for entry in WalkDir::new(self.subcrate_path.clone().unwrap().to_str().unwrap()) {
       let entry = entry.unwrap();
       println!("cargo:rerun-if-changed={}", entry.path().display());
     }
 
-    match self.ptx_linker {
-      false => self.run_xargo(),
-      true  => self.run_xargo_with_ptx_linker(),
-    }
-
-    let fatbin_path = self.run_nvcc();
+    let output = self.run_compiler(phase);
 
     // FIXME: instead of using WalkDir, can read the dependency file.
     let mut rs_paths = Vec::new();
@@ -438,7 +468,6 @@ impl Builder {
       let e = e.unwrap();
       if e.path().extension().and_then(|s| s.to_str()) == Some("rs") {
         let rs_path = e.path();
-        println!("DEBUG: maybe rs path: {:?}", rs_path);
         rs_paths.push(rs_path.to_owned());
       }
     }
@@ -462,7 +491,6 @@ impl Builder {
               &Some(ref abi) => {
                 if abi.name.as_ref().map(|s| s.value()) == Some("ptx-kernel".to_string()) {
                   // FIXME: crosscheck with whitelisted kernel set.
-                  println!("DEBUG: found ptx-kernel: {}", fun_item.ident.to_string());
                   let name = fun_item.ident.to_string();
                   let mut args = Vec::new();
                   for arg in fun_item.decl.inputs.iter() {
@@ -470,19 +498,11 @@ impl Builder {
                       &syn::FnArg::Captured(ref arg) => {
                         let arg_name = match &arg.pat {
                           &syn::Pat::Ident(ref pat) => {
-                            println!("DEBUG:   arg: {}", pat.ident.to_string());
                             pat.ident.to_string()
                           }
                           _ => panic!("unsupported ptx-kernel function argument pattern"),
                         };
-                        println!("DEBUG:     ty: {}", arg.ty.clone().into_token_stream().to_string());
                         let arg_ty = arg.ty.clone().into_token_stream().to_string();
-                        match &arg.ty {
-                          syn::Type::Ptr(ref _ptr) => {
-                            println!("DEBUG:       ty isptr");
-                          }
-                          _ => {}
-                        }
                         args.push((arg_name, arg_ty));
                       }
                       _ => panic!("unsupported ptx-kernel function argument"),
@@ -490,11 +510,9 @@ impl Builder {
                   }
                   let ret = match &fun_item.decl.output {
                     &syn::ReturnType::Default => {
-                      println!("DEBUG:   ret ty: ()");
                       None
                     }
                     &syn::ReturnType::Type(_, ref ret_ty) => {
-                      println!("DEBUG:   ret ty: {}", ret_ty.clone().into_token_stream().to_string());
                       Some(ret_ty.clone().into_token_stream().to_string())
                     }
                   };
@@ -515,7 +533,7 @@ impl Builder {
     }
 
     Ok(GlueSpec{
-      fatbin:   fatbin_path,
+      output:   output,
       funs:     glue_funs,
     })
   }
