@@ -26,3 +26,16 @@ safely launching CUDA kernels via the driver API in Rust. `nvptxglue` can
 generate RustaCUDA-compatible Rust bindings: what is needed is an implementation
 of the `Glue` trait to emit the generated Rust code to an arbitrary writer
 (todo; I reserved a `RustacudaGlue` type for this).
+
+## Examples
+
+Basic example using the builtin `CudaFfiGlue` writer
+(see the
+[build script](https://github.com/peterhj/nvptxglue-example/blob/master/build.rs)
+as well):
+
+    git clone https://github.com/peterhj/nvptxglue
+    git clone https://github.com/peterhj/nvptxglue-example
+    cd nvptxglue-example
+    cat build.rs
+    LIBRARY_PATH=/usr/local/cuda/lib64 cargo build --release   # or wherever your cuda libs are
