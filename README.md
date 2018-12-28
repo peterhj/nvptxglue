@@ -1,3 +1,5 @@
+(WIP so expect breakage and rough corners)
+
 `nvptxglue` is a [`bindgen`](https://github.com/rust-lang/rust-bindgen)-like
 utility for building Rust code and generating glue for `*-nvidia-cuda` targets.
 Like `bindgen`, `nvptxglue` is used in build scripts to generate Rust bindings.
